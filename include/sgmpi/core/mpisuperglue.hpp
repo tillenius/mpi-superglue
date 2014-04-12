@@ -31,7 +31,8 @@ struct SendDataTask : public MPITask<Options> {
     {
         this->is_prioritized = true;
 
-        this->depend(Options::AccessInfoType::write, t.send_handle);
+        version_t transfer_version = t.send_handle.schedule(Options::AccessInfoType::write);
+        this->fulfill(Options::AccessInfoType::write, t.send_handle, transfer_version);
 
         // TODO (HACK): wait for handle v[required_version]
         // We will not increase the version number after we are finished, since
