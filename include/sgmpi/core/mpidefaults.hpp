@@ -8,8 +8,6 @@
 #include "sg/option/taskqueue_prio.hpp"
 #include "sg/platform/gettime.hpp"
 
-#include <unistd.h>
-#include <dirent.h>
 #include <cstdlib>
 #include <cstdio>
 #include <sstream>
@@ -63,7 +61,7 @@ struct DefaultThreadAffinity {
 #ifdef SINGLE_NODE
         int cpuid = get_cores()*get_rank();
 #else
-        int cpuid = 0;
+        int cpuid = 1;
 #endif
         sg::affinity_cpu_set cpu_set;
         cpu_set.set(cpuid);
@@ -83,24 +81,24 @@ struct DefaultThreadAffinity {
 #ifdef SINGLE_NODE
         int cpuid = get_cores()*(get_rank()+1);
 #else
-        int cpuid = get_cores();
+        int cpuid = 0;
 #endif
         sg::affinity_cpu_set cpu_set;
-        cpu_set.set(cpuid-1);
+        cpu_set.set(cpuid);
         sg::ThreadAffinity::set_affinity(cpu_set);
-        { // todo: hard-coded for linux
-            // some MPI implementations create additional threads.
-            // this code finds all threads, and set their affinity.
-        DIR *dp;
-        assert((dp = opendir("/proc/self/task")) != NULL);
-        struct dirent *dirp;
-        while ((dirp = readdir(dp)) != NULL) {
-            if (dirp->d_name[0] == '.')
-                continue;
-            assert(sched_setaffinity(atoi(dirp->d_name), sizeof(cpu_set.cpu_set), &cpu_set.cpu_set) == 0);
-        }
-        closedir(dp);
-    }
+    //     { // todo: hard-coded for linux
+    //         // some MPI implementations create additional threads.
+    //         // this code finds all threads, and set their affinity.
+    //     DIR *dp;
+    //     assert((dp = opendir("/proc/self/task")) != NULL);
+    //     struct dirent *dirp;
+    //     while ((dirp = readdir(dp)) != NULL) {
+    //         if (dirp->d_name[0] == '.')
+    //             continue;
+    //         assert(sched_setaffinity(atoi(dirp->d_name), sizeof(cpu_set.cpu_set), &cpu_set.cpu_set) == 0);
+    //     }
+    //     closedir(dp);
+    // }
     }
 };
 
@@ -139,7 +137,7 @@ struct DefaultOptions : public sg::DefaultOptions<Options> {
     typedef Enable HandleId;
 
     // use integers for versions, as we want to send them in MPI messages as MPI_UNSIGNEDs
-    typedef unsigned int version_t;
+    typedef unsigned int version_type;
 
     // we always want the TaskExecutor in tasks
     typedef Enable PassTaskExecutor;

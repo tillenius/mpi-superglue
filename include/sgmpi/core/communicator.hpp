@@ -8,16 +8,15 @@
 #include <algorithm>
 #include <mpi.h>
 
-//#define SGMPI_BUSYLOOP
-
 namespace sgmpi {
 
 template<typename Options>
-class Communicator : public Options::Instrumentation {
-    typedef typename Options::version_t version_t;
+class Communicator : public TaskExecutor<Options> {
+    typedef typename Options::ReadyListType TaskQueue;
+    typedef typename TaskQueue::unsafe_t TaskQueueUnsafe;
+    typedef typename Options::version_type version_type;
     typedef typename Options::ThreadingManagerType ThreadingManager;
 
-    // FinishedSendTask
     struct FinishedSendTask : public sg::Task<Options> {
 
         FinishedSendTask(Handle<Options> &handle) {
@@ -30,14 +29,13 @@ class Communicator : public Options::Instrumentation {
         std::string get_name() { return "FinishedSendTask"; }
     };
 
-    // PublishDataTask
     struct PublishDataTask : public sg::Task<Options> {
-        typedef typename Options::version_t version_t;
+        typedef typename Options::version_type version_type;
 
         MPIHandle<Options> &handle;
         double *buffer;
 
-        PublishDataTask(MPIHandle<Options> &handle_, version_t required_version, double *data)
+        PublishDataTask(MPIHandle<Options> &handle_, version_type required_version, double *data)
         : handle(handle_), buffer(data) {
             this->fulfill(Options::AccessInfoType::write, handle, required_version);
             this->is_prioritized = true;
@@ -51,11 +49,11 @@ class Communicator : public Options::Instrumentation {
 
 
     struct request_t : public Options::MPIInstrumentation::MPIInstrData {
-        enum reqtype { invalid = 0, send, recv, terminate, event };
+        enum reqtype { invalid = 0, send, recv, event };
 
         reqtype type;
         MPIHandle<Options> *handle;
-        version_t required_version;
+        version_type required_version;
         void *buffer;
         int transfer_id;
         int rank;
@@ -67,7 +65,7 @@ class Communicator : public Options::Instrumentation {
         : type(send), handle(handle_), transfer_id(transfer_id_), rank(dest_rank_)
         {}
 
-        request_t(MPIHandle<Options> *handle_, version_t rv, int transfer_id_, int sender_rank_)
+        request_t(MPIHandle<Options> *handle_, version_type rv, int transfer_id_, int sender_rank_)
         : type(recv), handle(handle_), required_version(rv), transfer_id(transfer_id_), rank(sender_rank_)
         {}
 
@@ -91,30 +89,22 @@ private:
     std::vector<int> ongoing_recv;
     std::vector<int> ongoing_send;
 
-    MPI_Request send_req;
-
     SpinLock signal_lock;
     bool signal_flag;
-    volatile bool ok_to_quit;
+    bool shut_down;
 
 public:
-    bool terminate_flag;
+    char padding[64];
+    int no_work_agreement;
 
 private:
     void signal_event() {
-
         SpinLockScoped siglock(signal_lock);
         if (signal_flag)
             return;
 
         // no current signal, start a new one
         signal_flag = true;
-
-#ifndef SGMPI_BUSYLOOP
-        // wait for old send, just to be careful. the receive is already successful
-        assert( MPI_Wait( &send_req, MPI_STATUS_IGNORE ) == MPI_SUCCESS );
-        assert( MPI_Start( &send_req ) == MPI_SUCCESS );
-#endif // SGMPI_BUSYLOOP
     }
 
     void init() {
@@ -123,26 +113,6 @@ private:
 
         recv_requests = new std::deque<request_t>[num_ranks];
         send_requests = new std::deque<request_t>[num_ranks];
-
-        if (rank != 0) {
-            // wait for termination
-            MPI_Request term_req;
-            assert( MPI_Irecv(0, 0, MPI_UNSIGNED, 0, 0, MPI_COMM_WORLD, &term_req) == MPI_SUCCESS);
-            mpirequests.push_back(term_req);
-            requestinfo.push_back(request_t(request_t::terminate));
-        }
-
-#ifndef SGMPI_BUSYLOOP
-        // setup persistant request for waking MPI thread when desired.
-        // start with an existing signal, to make it correct to always do a wait() on the last send.
-        MPI_Request event_req;
-        assert( MPI_Send_init(0, 0, MPI_INT, rank, 1, MPI_COMM_WORLD, &send_req) == MPI_SUCCESS );
-        assert( MPI_Recv_init(0, 0, MPI_INT, rank, 1, MPI_COMM_WORLD, &event_req) == MPI_SUCCESS );
-        assert( MPI_Start( &event_req ) == MPI_SUCCESS );
-        assert( MPI_Start( &send_req ) == MPI_SUCCESS );
-        mpirequests.push_back(event_req);
-        requestinfo.push_back(request_t(request_t::event));
-#endif // SGMPI_BUSYLOOP
 
         ongoing_recv.resize(num_ranks, 0);
         ongoing_send.resize(num_ranks, 0);
@@ -155,22 +125,12 @@ private:
         signal_lock.unlock();
     }
 
-    void shut_down() {
-        if (rank == 0) {
-            // send termination messages
-            std::vector<MPI_Request> request(num_ranks-1);
-            for (int i = 1; i < num_ranks; ++i)
-                assert( MPI_Isend(0, 0, MPI_UNSIGNED, i, 0, MPI_COMM_WORLD, &request[i-1]) == MPI_SUCCESS );
-            assert( MPI_Waitall(num_ranks-1, &request[0], MPI_STATUSES_IGNORE) == MPI_SUCCESS );
-        }
-        assert( MPI_Finalize() == MPI_SUCCESS );
-    }
-
 public:
     Communicator(ThreadingManager &tman_)
-    : Options::Instrumentation(-1), tman(tman_),
+      : TaskExecutor<Options>(ThreadingManager::MPI_THREAD_ID, tman_),
+       tman(tman_),
        recv_requests(0), send_requests(0),
-       signal_flag(true), ok_to_quit(false), terminate_flag(false)
+       signal_flag(true), shut_down(false), no_work_agreement(0)
     {
         // take the signal lock here, and unlock first when init() is finished.
         signal_lock.lock();
@@ -199,7 +159,19 @@ public:
     }
 
     // called by main thread
-    void recv(MPIHandle<Options> &handle, version_t required_version, int transfer_id, int recv_from) {
+    void notify(MPIHandle<Options> &handle, int transfer_id, int send_to) {
+        bool need_to_signal;
+        {
+            SpinLockScoped scoped(send_request_lock);
+            need_to_signal = ongoing_send[send_to] < Options::limit_send_per_node;
+            send_requests[send_to].push_back(request_t::create_notify_request(&handle, transfer_id, send_to));
+        }
+        if (need_to_signal)
+            signal_event();
+    }
+
+    // called by main thread
+    void recv(MPIHandle<Options> &handle, version_type required_version, int transfer_id, int recv_from) {
         bool need_to_signal;
         {
             SpinLockScoped scoped(recv_request_lock);
@@ -210,13 +182,16 @@ public:
             signal_event();
     }
 
-    // called by main thread
     void terminate() {
-        ok_to_quit = true;
-        signal_event();
+        // called by main thread
+        SpinLockScoped siglock(signal_lock);
+        shut_down = true;
+        if (!signal_flag)
+            signal_flag = true;
     }
 
-    void barrier() {
+    void mpi_barrier() {
+        // can only be used when its known that mpi-superglue performs no mpi calls...
         assert( MPI_Barrier( MPI_COMM_WORLD ) == MPI_SUCCESS );
     }
 
@@ -230,15 +205,13 @@ public:
 
             // lock and check the requests queues
 
-#ifdef SGMPI_BUSYLOOP
             bool local_signal_flag = signal_flag;
             if (local_signal_flag) {
-                SpinLockScoped siglock(signal_lock);
-                signal_flag = false;
-            }
-            if (local_signal_flag)
-#endif // SGMPI_BUSYLOOP
-            {
+                {
+                    SpinLockScoped siglock(signal_lock);
+                    signal_flag = false;
+                }
+
                 {
                     SpinLockScoped scoped(recv_request_lock);
                     for (int i = 0; i < num_ranks; ++i) {
@@ -249,7 +222,7 @@ public:
                             continue;
 
                         requestinfo.push_back(recv_requests[i].front());
-                        request_t &req(requestinfo[requestinfo.size()-1]);
+                        request_t &req(requestinfo.back());
                         recv_requests[i].pop_front();
 
                         const size_t size = req.handle->get_size();
@@ -288,64 +261,81 @@ public:
                         ++ongoing_send[i];
                     }
                 }
-
-#ifndef SGMPI_BUSYLOOP
-                if (ok_to_quit && (mpirequests.size() == 1)) { // event request
-                    shut_down();
-                    return;
-                }
-#else
-                if (ok_to_quit && mpirequests.empty()) {
-                    shut_down();
-                    return;
-                }
-#endif
             }
 
-            if (mpirequests.empty())
-                continue;
+            if (mpirequests.empty()) {
+
+                // execute tasks
+                {
+                    TaskExecutor<Options> *this_(static_cast<TaskExecutor<Options> *>(this));
+                    if (tman.barrier_protocol.update_barrier_state(*this_)) {
+                        TaskQueueUnsafe woken;
+                        if (TaskExecutor<Options>::execute_tasks(woken)) {
+                            if (!woken.empty())
+                                TaskExecutor<Options>::push_front_list(woken);
+                            // tasks executed => restart barrier.
+                            if (no_work_agreement != 0)
+                                no_work_agreement = 0;
+                        }
+                    }
+                }
+
+                if (signal_flag)
+                    continue;
+
+                Atomic::compiler_fence(); // re-read no_work_agreement
+                switch (no_work_agreement) {
+                case 0:
+                    // no barrier and no mpi requests. just loop.
+                    continue;
+                case 1:
+                    // initialized, and no work seen.
+                    no_work_agreement = 2;
+                    continue;
+                case 2:
+                    // wait for other thread to respond
+                    continue;
+                case 3:
+                    // barrier finalized.
+                    no_work_agreement = 4;
+                    break;
+                }
+
+                // no work seen since last barrier finished.
+
+                // if not shutting down, just loop and wait for or another barrier.
+                if (!shut_down)
+                    continue;
+
+                // shut down.
+                assert(MPI_Finalize() == MPI_SUCCESS);
+                return;
+            }
+
+            // mpi events in queue, restart barrier if initialized
+            if (no_work_agreement != 0)
+                no_work_agreement = 0;
 
             indices.resize(mpirequests.size());
 
             int outcount = 0;
-#ifndef SGMPI_BUSYLOOP
-            assert( MPI_Waitsome(mpirequests.size(), &mpirequests[0], &outcount, &indices[0], MPI_STATUSES_IGNORE) == MPI_SUCCESS );
-#else // SGMPI_BUSYLOOP
             assert( MPI_Testsome(mpirequests.size(), &mpirequests[0], &outcount, &indices[0], MPI_STATUSES_IGNORE) == MPI_SUCCESS );
-#endif // SGMPI_BUSYLOOP
             Time::TimeUnit stop = Time::getTime();
 
             if (outcount > 0) {
-#ifdef SGMPI_BUSYLOOP
                 {
                     SpinLockScoped siglock(signal_lock);
-                    signal_flag = true;
+                    if (!signal_flag)
+                        signal_flag = true;
                 }
-#endif // SGMPI_BUSYLOOP
 
                 for (int i = 0; i < outcount; ++i) {
                     const int idx = indices[i];
                     const request_t req(requestinfo[idx]);
 
-#ifndef SGMPI_BUSYLOOP
-                    if (req.type == request_t::event) {
-                        {
-                            SpinLockScoped siglock(signal_lock);
-                            assert(signal_flag);
-                            signal_flag = false;
-                            assert( MPI_Start( &mpirequests[idx] ) == MPI_SUCCESS );
-                        }
-                        continue;
-                    }
-#endif // SGMPI_BUSYLOOP
-
                     mpirequests[idx] = MPI_REQUEST_NULL;
 
                     switch (req.type) {
-                        case request_t::terminate:
-                            terminate_flag = true;
-                        continue;
-
                         case request_t::recv: {
                             Options::MPIInstrumentation::recv(req, stop);
                             sg.submit( new PublishDataTask(*req.handle, req.required_version, (double*) req.buffer) );
@@ -358,7 +348,6 @@ public:
                         }
                         continue;
 
-                        case request_t::event: // already handled above, or not used
                         case request_t::invalid: // "should never happen"
                         default:
                             continue;
@@ -386,7 +375,15 @@ public:
                     std::swap(new_requestinfo, requestinfo);
                     std::swap(new_mpirequests, mpirequests);
                 }
-
+            }
+            else {
+                TaskExecutor<Options> *this_(static_cast<TaskExecutor<Options> *>(this));
+                if (tman.barrier_protocol.update_barrier_state(*this_)) {
+                    TaskQueueUnsafe woken;
+                    TaskExecutor<Options>::execute_tasks(woken);
+                    if (!woken.empty())
+                        TaskExecutor<Options>::push_front_list(woken);
+                }
             }
         }
     }

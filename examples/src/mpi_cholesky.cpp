@@ -191,12 +191,13 @@ void cholmain(sgmpi::MPISuperGlue<Options> &nm) {
 
     chol(nm, DIM, A);
 
-    nm.wait(A(DIM-1, DIM-1));
+    nm.barrier();
+
 
     delete [] data;
 
     std::stringstream ss;
-    ss << "trace-" << rank << ".log";
+    ss << "trace-" << rank << ".trace";
     Log<Options>::dump(ss.str().c_str(), rank);
 }
 

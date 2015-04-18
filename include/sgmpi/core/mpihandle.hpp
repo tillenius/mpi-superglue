@@ -7,7 +7,7 @@ namespace sgmpi {
 
 template <typename Options>
 class MPIHandleBase : public sg::Handle<Options> {
-    typedef typename Options::version_t version_t;
+    typedef typename Options::version_type version_type;
 private:
     int owner_rank;
 
@@ -18,7 +18,7 @@ public:
     int last_written_rank;
     std::vector<bool> copies;
 
-    MPIHandleBase() : owner_rank(0), last_written_rank(0) {}
+    MPIHandleBase() : owner_rank(0), size(0), data(0), last_written_rank(0) {}
 
     void set_rank(int new_owner_rank) {
         owner_rank = new_owner_rank;

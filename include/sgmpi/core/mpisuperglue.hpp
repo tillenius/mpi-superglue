@@ -19,19 +19,19 @@ template <typename Options> class Communicator;
 
 template <typename Options>
 struct SendDataTask : public MPITask<Options> {
-    typedef typename Options::version_t version_t;
+    typedef typename Options::version_type version_type;
 
     Communicator<Options> &t;
     MPIHandle<Options> &handle;
     int transfer_id;
     int dest_rank;
 
-    SendDataTask(Communicator<Options> &t_, MPIHandle<Options> &handle_, version_t required_version, int transfer_id_, int dest_rank_)
+    SendDataTask(Communicator<Options> &t_, MPIHandle<Options> &handle_, version_type required_version, int transfer_id_, int dest_rank_)
     : t(t_), handle(handle_), transfer_id(transfer_id_), dest_rank(dest_rank_)
     {
         this->is_prioritized = true;
 
-        version_t transfer_version = t.send_handle.schedule(Options::AccessInfoType::write);
+        version_type transfer_version = t.send_handle.schedule(Options::AccessInfoType::write);
         this->fulfill(Options::AccessInfoType::write, t.send_handle, transfer_version);
 
         // TODO (HACK): wait for handle v[required_version]
@@ -62,7 +62,7 @@ class MPISuperGlue : public Options::TaskRankDecider {
 
     typedef typename Options::AccessInfoType AccessInfo;
     typedef typename AccessInfo::Type AccessType;
-    typedef typename Options::version_t version_t;
+    typedef typename Options::version_type version_type;
 
 public:
     sg::SuperGlue<Options> sg;
@@ -101,13 +101,13 @@ private:
 
                 if (my_rank == handle.last_written_rank) {
                     // need to send
-                    const version_t required_version = handle.schedule(Options::AccessInfoType::read);
+                    const version_type required_version = handle.schedule(Options::AccessInfoType::read);
                     //fprintf(stderr, "%d: need-to-send handle %d to %d before '%s'\n", rank, handle.get_global_id(), task_rank, task.get_name().c_str());
                     sg.submit( new SendDataTask<Options>(sg.tman->mpicomm, handle, required_version, transfer_id, task_rank) );
                 }
                 else if (my_rank == task_rank) {
                     // need to receive
-                    const version_t required_version = handle.schedule(Options::AccessInfoType::write);
+                    const version_type required_version = handle.schedule(Options::AccessInfoType::write);
                     const int sender_rank = handle.last_written_rank;
                     //fprintf(stderr, "%d: register_access(%s): need to receive handle %d (req v%d)\n", 
                     //    rank, task.get_name().c_str(), handle.get_global_id(), required_version);
@@ -121,16 +121,14 @@ private:
                 }
                 else {
                     handle.last_written_rank = task_rank;
-                    handle.copies.clear();
-                    handle.copies.resize(get_num_ranks());
+                    std::fill(handle.copies.begin(), handle.copies.end(), false);
                 }
             }
             else {
                 // update cache
                 if (!AccessUtil<Options>::readonly(type)) {
                     handle.last_written_rank = task_rank;
-                    handle.copies.clear();
-                    handle.copies.resize(get_num_ranks());
+                    std::fill(handle.copies.begin(), handle.copies.end(), false);
                 }
             }
 
@@ -138,7 +136,7 @@ private:
                 // local task
 
                 // register locally and require local version
-                version_t required_version = handle.schedule(type);
+                version_type required_version = handle.schedule(type);
 
                 // store access in the task
                 task.fulfill(type, handle, required_version);
@@ -153,6 +151,9 @@ private:
 public:
 
     MPISuperGlue(ThreadingManagerMPI<Options> &tman_) : sg(tman_), transfer_id(2) {}
+    ~MPISuperGlue() {
+        sg.tman->mpicomm.terminate();
+    }
 
     void submit(MPITask<Options> *task) {
         submit_to_rank(task, Options::TaskRankDecider::determine_task_rank(task));
@@ -185,19 +186,67 @@ public:
     }
 
     void mpi_barrier() {
-        sg.tman->mpicomm.barrier();
+        sg.tman->mpicomm.mpi_barrier();
     }
 
-    void wait(MPIHandle<Options> &handle) {
-        if (get_rank() == handle.get_rank())
-            sg.wait(handle);
-        else {
-            while (!sg.tman->mpicomm.terminate_flag) {
-                sg.barrier();
+    // wait until all tasks have been executed and the mpi queue is empty
+    void barrier() {
+        // on main thread 
+        // only tasks and mpi communication can add new tasks
+
+        TaskExecutor<Options> &main_task_executor(*sg.tman->get_worker(Options::ThreadingManagerType::MAIN_THREAD_ID));
+
+        int &status(sg.tman->mpicomm.no_work_agreement);
+        for (;;) {
+
+            int local_status;
+
+            // execute all tasks
+            sg.tman->barrier_protocol.barrier(main_task_executor);
+
+            // initialize agreement
+            status = 1;
+            Atomic::memory_fence_producer();
+
+            // wait on MPI thread
+            do {
                 Atomic::rep_nop();
+                local_status = status;
+            } while (local_status == 1);
+
+            if (local_status == 0) {
+                // mpi events occurred -- must repeat the process
+                continue;
             }
+
+            // execute tasks that might have been created
+            // by mpi thread before it saw that we initialized
+            // an agreement.
+            sg.tman->barrier_protocol.barrier(main_task_executor);
+
+            // second pass -- to ensure no new mpi events have 
+            // been created by those tasks
+            status = 3;
+            Atomic::memory_fence_producer();
+
+            do {
+                Atomic::rep_nop();
+                local_status = status;
+            } while (local_status == 3);
+
+            if (local_status == 0) {
+                // mpi events occurred -- must repeat the process
+                continue;
+            }
+
+            return;
         }
     }
+
+    /// Wait for MPI handles not supported!
+private:
+    void wait(MPIHandle<Options> &handle);
+public:
 
     void wait(Handle<Options> &handle) {
         sg.wait(handle);

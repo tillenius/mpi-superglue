@@ -19,6 +19,8 @@ template <typename Options>
 class ThreadingManagerMPI {
     typedef typename Options::ReadyListType TaskQueue;
     typedef typename Options::ThreadingManagerType ThreadingManager;
+public:
+    enum { MPI_THREAD_ID = 0, MAIN_THREAD_ID = 1, WORKER_THREAD_ID_BASE = 2 };
 
 private:
 
@@ -27,14 +29,17 @@ private:
     // ===========================================================================
     struct MainThread : public sg::Thread {
         ThreadingManagerMPI<Options> &tman;
+        sg::TaskExecutor<Options> *task_executor;
 
         MainThread(sgmpi::ThreadingManagerMPI<Options> &tman_) : tman(tman_) {}
 
         void run() {
+            // MAIN THREAD [id 1]
             Options::ThreadAffinity::pin_main_thread();
+            task_executor = new sg::TaskExecutor<Options>(MAIN_THREAD_ID, tman);
 
-            tman.threads[0] = new sg::TaskExecutor<Options>(0, tman);
-            tman.task_queues[0] = &tman.threads[0]->get_task_queue();
+            tman.task_executors[MAIN_THREAD_ID] = task_executor;
+            tman.task_queues[MAIN_THREAD_ID] = &tman.task_executors[MAIN_THREAD_ID]->get_task_queue();
 
             {
                 MPISuperGlue<Options> mpisg(tman);
@@ -47,14 +52,15 @@ private:
                 // run main
                 tman.main_function(mpisg);
 
-                // MPISuperGlue and sg::SuperGlue destructed here
+                // MPISuperGlue (and sg::SuperGlue) destructed here => implicit barrier.
             }
-
-            tman.mpicomm.terminate();
 
             // wait for mpicomm to shut down
             tman.lock_mpicomm_running.lock();
             tman.lock_mpicomm_running.unlock();
+        }
+        ~MainThread() {
+            delete task_executor;
         }
     };
 
@@ -62,21 +68,24 @@ private:
     // WorkerThread: Thread to run worker
     // ===========================================================================
     class WorkerThread : public sg::Thread {
-    private:
+    public:
         const int id;
+    private:
         ThreadingManagerMPI &tman;
+        sg::TaskExecutor<Options> *task_executor;
 
     public:
         WorkerThread(int id_, ThreadingManagerMPI &tman_)
         : id(id_), tman(tman_) {}
 
         void run() {
+            // WORKER THREAD [id 2 -- id N]
             Options::ThreadAffinity::pin_workerthread(id);
             // allocate Worker on thread
-            sg::TaskExecutor<Options> *te = new sg::TaskExecutor<Options>(id, tman);
+            task_executor = new sg::TaskExecutor<Options>(id, tman);
 
-            tman.threads[id] = te;
-            tman.task_queues[id] = &te->get_task_queue();
+            tman.task_executors[id] = task_executor;
+            tman.task_queues[id] = &task_executor->get_task_queue();
             sg::Atomic::memory_fence_producer();
             sg::Atomic::increase(&tman.start_counter);
 
@@ -87,7 +96,10 @@ private:
             // wait for mpicomm to initialize
             tman.mpicomm.wait_for_startup();
 
-            te->work_loop();
+            task_executor->work_loop();
+        }
+        ~WorkerThread() {
+            delete task_executor;
         }
     };
 
@@ -106,8 +118,8 @@ private:
 public:
     Communicator<Options> mpicomm;
     sg::BarrierProtocol<Options> barrier_protocol;
-    sg::TaskExecutor<Options> **threads;
-    TaskQueue **task_queues;
+    std::vector<sg::TaskExecutor<Options> *> task_executors;
+    std::vector<TaskQueue *> task_queues;
     char padding2[Options::CACHE_LINE_SIZE];
     MainThread *main_thread;
 
@@ -121,9 +133,9 @@ private:
 
     int decide_num_cpus_inner(int requested) {
         assert(requested == -1 || requested > 0);
-        const char *var = getenv("OMP_NUM_THREADS");
-        if (var != NULL) {
-            const int OMP_NUM_THREADS(atoi(var));
+        std::string var = sg_getenv("OMP_NUM_THREADS");
+        if (!var.empty()) {
+            const int OMP_NUM_THREADS(atoi(var.c_str()));
             assert(OMP_NUM_THREADS >= 0);
             if (OMP_NUM_THREADS != 0)
                 return OMP_NUM_THREADS;
@@ -134,7 +146,7 @@ private:
     }
 
     int decide_num_cpus(int requested) {
-        const int num_cpus = decide_num_cpus_inner(requested)-1;
+        const int num_cpus = decide_num_cpus_inner(requested);
         assert(num_cpus > 0);
         return num_cpus;
     }
@@ -154,28 +166,25 @@ public:
       mpicomm(*static_cast<ThreadingManager *>(this)),
       barrier_protocol(*static_cast<ThreadingManager *>(this))
     {
+        // MPI THREAD [id 0]
 
-    #ifdef SGMPI_BUSYLOOP
         assert( MPI_Init(NULL, NULL) == MPI_SUCCESS );
-    #else
-        int provided;
-        assert( MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided) == MPI_SUCCESS );
-        assert( provided == MPI_THREAD_MULTIPLE );
-    #endif
-
         assert( MPI_Comm_rank(MPI_COMM_WORLD, &rank) == MPI_SUCCESS );
         assert( MPI_Comm_size(MPI_COMM_WORLD, &num_ranks) == MPI_SUCCESS );
 
-        //const int num_cpus = Options::ThreadBackend::decide_num_cpus(-1);
         Options::ThreadAffinity::init();
-        Options::ThreadAffinity::init(rank, num_cpus+1);
+        Options::ThreadAffinity::init(rank, num_cpus);
         Options::ThreadAffinity::pin_mpi_thread();
 
         main_thread_initialized.lock();
         lock_workers_initialized.lock();
         lock_mpicomm_running.lock();
-        threads = new sg::TaskExecutor<Options> *[num_cpus];
-        task_queues = new TaskQueue*[num_cpus];
+
+        task_executors.resize(num_cpus);
+        task_queues.resize(num_cpus);
+
+        task_executors[MPI_THREAD_ID] = &mpicomm;
+        task_queues[MPI_THREAD_ID] = &mpicomm.get_task_queue();
 
         // start main thread.
         // main thread unlocks main_thread_initialized when inited
@@ -185,15 +194,16 @@ public:
 
         // start worker threads.
         // workers will increase start_counter, then wait for lock_workers_initialized
-        const int num_workers(num_cpus-1);
+        const size_t num_workers(num_cpus - WORKER_THREAD_ID_BASE);
+
         workerthreads.resize(num_workers);
-        for (int i = 0; i < num_workers; ++i) {
-            workerthreads[i] = new WorkerThread(i+1, *this);
+        for (size_t i = 0; i < num_workers; ++i) {
+            workerthreads[i] = new WorkerThread(i + WORKER_THREAD_ID_BASE, *this);
             workerthreads[i]->start();
         }
 
         // wait for all workers to register
-        while (start_counter != num_cpus-1)
+        while (start_counter != num_workers)
             sg::Atomic::rep_nop();
         sg::Atomic::memory_fence_consumer();
 
@@ -211,26 +221,23 @@ public:
     }
 
     ~ThreadingManagerMPI() {
-        // shut down main thread
+        // MPI THREAD [id 0]
+
+        // wait for main thread to shut down
         main_thread->join();
-        delete main_thread;
 
         // shut down workers
-        for (int i = 1; i < get_num_cpus(); ++i)
-            threads[i]->terminate();
+        for (size_t i = 0; i < workerthreads.size(); ++i)
+            task_executors[workerthreads[i]->id]->terminate();
 
-        const int num_workers(num_cpus-1);
-        for (int i = 0; i < num_workers; ++i)
+        // wait for workers
+        for (size_t i = 0; i < workerthreads.size(); ++i)
             workerthreads[i]->join();
 
         // cleanup memory
-        for (int i = 0; i < num_workers; ++i)
+        delete main_thread;
+        for (size_t i = 0; i < workerthreads.size(); ++i)
             delete workerthreads[i];
-        for (int i = 0; i < num_cpus; ++i)
-            delete threads[i];
-
-        delete [] threads;
-        delete [] task_queues;
     }
 
     void init() {
@@ -238,8 +245,9 @@ public:
     }
 
     void stop() {
-        start_executing(); // make sure threads have been started, or we will wait forever in barrier
-        barrier_protocol.barrier(*threads[0]);
+        // called from main thread, when superglue is destructed.
+        // no need to do a superglue barrier here, since that is
+        // included in shutting down mpi-superglue.
     }
 
     void start_executing() {
@@ -248,7 +256,7 @@ public:
     }
 
     TaskQueue **get_task_queues() const { return const_cast<TaskQueue**>(&task_queues[0]); }
-    sg::TaskExecutor<Options> *get_worker(int i) { return threads[i]; }
+    sg::TaskExecutor<Options> *get_worker(int i) { return task_executors[i]; }
     int get_num_cpus() { return num_cpus; }
 
     // specific for mpi
